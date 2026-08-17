@@ -417,6 +417,82 @@ def draw_grouped_legend(plot_handles, plot_labels, event_handles, event_labels):
     )
 
 
+def draw_compact_legend(handles, labels):
+    handles_by_label = {}
+    for handle, label in zip(handles, labels):
+        handles_by_label.setdefault(label, handle)
+
+    if "Migration start" in handles_by_label:
+        compact_items = (
+            ("Median", "Median"),
+            ("Baseline median", "Baseline median"),
+            ("Migration start", "Migration start"),
+            ("Active migration", "Active"),
+            ("Downtime window", "Downtime"),
+            ("Migration complete", "Complete"),
+        )
+    elif (
+        "Switchover time" in handles_by_label
+        or "controlled switchover time" in handles_by_label
+    ):
+        compact_items = (
+            ("Median", "Median"),
+            ("Standby postgres ready", "Standby PostgreSQL ready"),
+            ("standby postgres ready", "Standby PostgreSQL ready"),
+            ("Standby ready (WAL lag check done)", "Standby ready"),
+            ("standby ready (WAL lag check done)", "Standby ready"),
+            ("Switchover time", "Switchover"),
+            ("controlled switchover time", "Switchover"),
+            ("YCSB resumed", "YCSB resumed"),
+        )
+    else:
+        comparison_items = []
+        if "Median" in handles_by_label:
+            comparison_items.append(("Median", "Median"))
+        comparison_items.extend(
+            (label, label.removesuffix(" Median"))
+            for label in labels
+            if label.endswith(" Median")
+        )
+        compact_items = tuple(comparison_items) + (
+            ("Shutdown requested", "Shutdown"),
+            ("shutdown requested", "Shutdown"),
+            ("Restart gap", "Restart gap"),
+            ("restart gap", "Restart gap"),
+            ("Switchover time", "Switchover"),
+            ("controlled switchover time", "Switchover"),
+            ("YCSB resumed", "Resumed"),
+        )
+
+    compact_handles = []
+    compact_labels = []
+    added_labels = set()
+    for source_label, display_label in compact_items:
+        handle = handles_by_label.get(source_label)
+        if handle is not None and display_label not in added_labels:
+            compact_handles.append(handle)
+            compact_labels.append(display_label)
+            added_labels.add(display_label)
+
+    if not compact_handles:
+        return
+
+    legend = plt.legend(
+        compact_handles,
+        compact_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.0),
+        ncol=len(compact_handles),
+        fontsize="x-small",
+        frameon=False,
+        handlelength=1.3,
+        handletextpad=0.3,
+        columnspacing=0.6,
+        borderaxespad=0.2,
+    )
+    legend.set_in_layout(False)
+
+
 def draw_migration_note(downtimes, migration_durations):
     note_lines = []
     if downtimes:
@@ -673,7 +749,53 @@ def restart_ssh_label(markers):
     return "SSH ready after restart"
 
 
-def draw_timing_markers(markers, mode):
+def configured_line_width(override, default):
+    return default if override is None else override
+
+
+def draw_active_phase_band(
+    phase_start,
+    phase_end,
+    downtime_window=None,
+    label="Active migration",
+    alpha=0.08,
+):
+    segments = [(phase_start, phase_end)]
+
+    if downtime_window is not None:
+        downtime_start = max(phase_start, downtime_window[0])
+        downtime_end = min(phase_end, downtime_window[1])
+        if downtime_start < downtime_end:
+            segments = [
+                (phase_start, downtime_start),
+                (downtime_end, phase_end),
+            ]
+
+    drew_band = False
+    for start, end in segments:
+        if end <= start:
+            continue
+        plt.axvspan(
+            start,
+            end,
+            color="tab:blue",
+            alpha=alpha,
+            zorder=0.5,
+            label=label if not drew_band else None,
+        )
+        drew_band = True
+
+    return drew_band
+
+
+def draw_timing_markers(
+    markers,
+    mode,
+    draw_timing_note=True,
+    shade_migration_phase=False,
+    event_line_width=None,
+    compact_legend=False,
+):
     if not markers:
         return
 
@@ -698,12 +820,12 @@ def draw_timing_markers(markers, mode):
             if marker["migration_duration_qmp"] is not None
         ]
 
-        if destination_boots:
+        if destination_boots and not compact_legend:
             plt.axvline(
                 mean(destination_boots),
                 color="tab:purple",
                 linestyle="-.",
-                linewidth=2.0,
+                linewidth=configured_line_width(event_line_width, 2.0),
                 label="Destination boot",
             )
 
@@ -711,23 +833,33 @@ def draw_timing_markers(markers, mode):
             migration_start,
             color="tab:blue",
             linestyle=":",
-            linewidth=2.0,
+            linewidth=configured_line_width(event_line_width, 2.0),
             label="Migration start",
         )
 
+        downtime_window = None
         if stop_copy_gaps:
-            plt.axvspan(
+            downtime_window = (
                 mean([gap[0] for gap in stop_copy_gaps]),
                 mean([gap[1] for gap in stop_copy_gaps]),
-                color="tab:red",
-                alpha=0.12,
-                label="Downtime window",
             )
         elif downtimes:
             downtime = median(downtimes)
-            plt.axvspan(
+            downtime_window = (
                 migration_end - downtime,
                 migration_end,
+            )
+
+        if shade_migration_phase:
+            draw_active_phase_band(
+                migration_start,
+                migration_end,
+                downtime_window,
+            )
+
+        if downtime_window is not None:
+            plt.axvspan(
+                *downtime_window,
                 color="tab:red",
                 alpha=0.12,
                 label="Downtime window",
@@ -737,10 +869,11 @@ def draw_timing_markers(markers, mode):
             migration_end,
             color="tab:red",
             linestyle="--",
-            linewidth=2.0,
+            linewidth=configured_line_width(event_line_width, 2.0),
             label="Migration complete",
         )
-        draw_migration_note(downtimes, migration_durations)
+        if draw_timing_note:
+            draw_migration_note(downtimes, migration_durations)
         return
 
     labels = {
@@ -759,13 +892,14 @@ def draw_timing_markers(markers, mode):
         if marker["migration_duration_qmp"] is not None
     ]
 
+    migration_band_label = "Active migration"
     for marker in markers:
-        if marker["destination_boot"] is not None:
+        if marker["destination_boot"] is not None and not compact_legend:
             plt.axvline(
                 marker["destination_boot"],
                 color="tab:purple",
                 linestyle="-.",
-                linewidth=1.0,
+                linewidth=configured_line_width(event_line_width, 1.0),
                 alpha=0.35,
                 label=labels.pop("destination_boot", None),
             )
@@ -774,25 +908,33 @@ def draw_timing_markers(markers, mode):
             marker["migration_start"],
             color="tab:blue",
             linestyle=":",
-            linewidth=1.0,
+            linewidth=configured_line_width(event_line_width, 1.0),
             alpha=0.35,
             label=labels.pop("migration_start", None),
         )
 
         stop_copy_gap = marker.get("stop_copy_gap")
+        downtime_window = None
         if stop_copy_gap is not None:
-            gap_start, gap_end = stop_copy_gap
-            plt.axvspan(
-                gap_start,
-                gap_end,
-                color="tab:red",
-                alpha=0.05,
-                label=labels.pop("downtime", None),
-            )
+            downtime_window = stop_copy_gap
         elif marker["downtime"] is not None:
-            plt.axvspan(
+            downtime_window = (
                 marker["migration_end"] - marker["downtime"],
                 marker["migration_end"],
+            )
+
+        if shade_migration_phase and draw_active_phase_band(
+            marker["migration_start"],
+            marker["migration_end"],
+            downtime_window,
+            label=migration_band_label,
+            alpha=0.04,
+        ):
+            migration_band_label = None
+
+        if downtime_window is not None:
+            plt.axvspan(
+                *downtime_window,
                 color="tab:red",
                 alpha=0.05,
                 label=labels.pop("downtime", None),
@@ -802,15 +944,23 @@ def draw_timing_markers(markers, mode):
             marker["migration_end"],
             color="tab:red",
             linestyle="--",
-            linewidth=1.0,
+            linewidth=configured_line_width(event_line_width, 1.0),
             alpha=0.35,
             label=labels.pop("migration_end", None),
         )
 
-    draw_migration_note(downtimes, migration_durations)
+    if draw_timing_note:
+        draw_migration_note(downtimes, migration_durations)
 
 
-def draw_restart_markers(markers, mode):
+def draw_restart_markers(
+    markers,
+    mode,
+    draw_timing_note=True,
+    event_line_width=None,
+    compact_legend=False,
+    shade_active_phase=False,
+):
     if not markers:
         return
 
@@ -843,43 +993,58 @@ def draw_restart_markers(markers, mode):
             marker["resume"] - marker["shutdown_request"] for marker in markers
         ]
 
-        plt.axvline(
-            shutdown_request,
-            color="tab:orange",
-            linestyle=":",
-            linewidth=2.0,
-            label="Shutdown requested",
-        )
-        plt.axvline(
-            shutdown_finished,
-            color="tab:red",
-            linestyle="--",
-            linewidth=2.0,
-            label="Shutdown finished",
-        )
-        plt.axvspan(
+        if not compact_legend or not prepared:
+            plt.axvline(
+                shutdown_request,
+                color="tab:orange",
+                linestyle=":",
+                linewidth=configured_line_width(event_line_width, 2.0),
+                label="Shutdown requested",
+            )
+        if not compact_legend:
+            plt.axvline(
+                shutdown_finished,
+                color="tab:red",
+                linestyle="--",
+                linewidth=configured_line_width(event_line_width, 2.0),
+                label="Shutdown finished",
+            )
+        switchover_start = (
             resume - median(controlled_switchover_times)
             if controlled_switchover_times
-            else shutdown_request,
+            else shutdown_request
+        )
+        if prepared and shade_active_phase:
+            draw_active_phase_band(
+                postgres2_ready,
+                switchover_start,
+                label=None,
+            )
+        plt.axvspan(
+            switchover_start,
             resume,
             color="tab:red",
             alpha=0.12,
             label="Switchover time" if prepared else "Restart gap",
         )
-        plt.axvline(
-            ssh2_ready,
-            color="tab:purple",
-            linestyle=":",
-            linewidth=1.4 if prepared else 2.0,
-            alpha=0.45 if prepared else 1.0,
-            label=ssh_label,
-        )
+        if not compact_legend:
+            plt.axvline(
+                ssh2_ready,
+                color="tab:purple",
+                linestyle=":",
+                linewidth=configured_line_width(
+                    event_line_width,
+                    1.4 if prepared else 2.0,
+                ),
+                alpha=0.45 if prepared else 1.0,
+                label=ssh_label,
+            )
         if prepared:
             plt.axvline(
                 postgres2_ready,
                 color="tab:green",
                 linestyle=":",
-                linewidth=1.4,
+                linewidth=configured_line_width(event_line_width, 1.4),
                 alpha=0.45,
                 label="Standby postgres ready",
             )
@@ -888,30 +1053,30 @@ def draw_restart_markers(markers, mode):
                     mean(standby_readies),
                     color="tab:cyan",
                     linestyle="-.",
-                    linewidth=2.0,
+                    linewidth=configured_line_width(event_line_width, 2.0),
                     label="Standby ready (WAL lag check done)",
                 )
-            if promotion_starts:
+            if promotion_starts and not compact_legend:
                 plt.axvline(
                     mean(promotion_starts),
                     color="tab:blue",
                     linestyle="-.",
-                    linewidth=2.0,
+                    linewidth=configured_line_width(event_line_width, 2.0),
                     label="Promotion start",
                 )
-            if promotion_dones:
+            if promotion_dones and not compact_legend:
                 plt.axvline(
                     mean(promotion_dones),
                     color="tab:blue",
                     linestyle="--",
-                    linewidth=2.0,
+                    linewidth=configured_line_width(event_line_width, 2.0),
                     label="Promotion complete",
                 )
         plt.axvline(
             resume,
             color="tab:green",
             linestyle="--",
-            linewidth=2.0,
+            linewidth=configured_line_width(event_line_width, 2.0),
             label=postgres_label,
         )
         note_label = (
@@ -919,17 +1084,19 @@ def draw_restart_markers(markers, mode):
             if prepared
             else "Median service interruption"
         )
-        draw_restart_note(
-            restart_durations,
-            note_label,
-            preparation_phase_durations(markers) if prepared else None,
-        )
+        if draw_timing_note:
+            draw_restart_note(
+                restart_durations,
+                note_label,
+                preparation_phase_durations(markers) if prepared else None,
+            )
         return
 
+    prepared = all(marker["prepared"] for marker in markers)
     labels = {
         "shutdown_request": "shutdown requested",
         "shutdown_finished": "shutdown finished",
-        "restart_gap": "controlled switchover time" if all(marker["prepared"] for marker in markers) else "restart gap",
+        "restart_gap": "controlled switchover time" if prepared else "restart gap",
         "ssh2_ready": restart_ssh_label(markers),
         "postgres2_ready": "standby postgres ready",
         "standby_ready": "standby ready (WAL lag check done)",
@@ -944,54 +1111,67 @@ def draw_restart_markers(markers, mode):
         for marker in markers
     ]
     for marker in markers:
-        plt.axvline(
-            marker["shutdown_request"],
-            color="tab:orange",
-            linestyle=":",
-            linewidth=1.0,
-            alpha=0.35,
-            label=labels.pop("shutdown_request", None),
-        )
-        plt.axvline(
-            marker["shutdown_finished"],
-            color="tab:red",
-            linestyle="--",
-            linewidth=1.0,
-            alpha=0.35,
-            label=labels.pop("shutdown_finished", None),
-        )
-        plt.axvspan(
+        if not compact_legend or not prepared:
+            plt.axvline(
+                marker["shutdown_request"],
+                color="tab:orange",
+                linestyle=":",
+                linewidth=configured_line_width(event_line_width, 1.0),
+                alpha=0.35,
+                label=labels.pop("shutdown_request", None),
+            )
+        if not compact_legend:
+            plt.axvline(
+                marker["shutdown_finished"],
+                color="tab:red",
+                linestyle="--",
+                linewidth=configured_line_width(event_line_width, 1.0),
+                alpha=0.35,
+                label=labels.pop("shutdown_finished", None),
+            )
+        switchover_start = (
             marker["resume"] - marker["controlled_switchover_time"]
             if marker.get("controlled_switchover_time") is not None
-            else marker["shutdown_request"],
+            else marker["shutdown_request"]
+        )
+        if marker["prepared"] and shade_active_phase:
+            draw_active_phase_band(
+                marker["postgres2_ready"],
+                switchover_start,
+                label=None,
+                alpha=0.04,
+            )
+        plt.axvspan(
+            switchover_start,
             marker["resume"],
             color="tab:red",
             alpha=0.05,
             label=labels.pop("restart_gap", None),
         )
-        plt.axvline(
-            marker["ssh2_ready"],
-            color="tab:purple",
-            linestyle=":",
-            linewidth=1.0,
-            alpha=0.18 if marker["prepared"] else 0.35,
-            label=labels.pop("ssh2_ready", None),
-        )
+        if not compact_legend:
+            plt.axvline(
+                marker["ssh2_ready"],
+                color="tab:purple",
+                linestyle=":",
+                linewidth=configured_line_width(event_line_width, 1.0),
+                alpha=0.18 if marker["prepared"] else 0.35,
+                label=labels.pop("ssh2_ready", None),
+            )
         if marker["prepared"]:
             plt.axvline(
                 marker["postgres2_ready"],
                 color="tab:green",
                 linestyle=":",
-                linewidth=1.0,
+                linewidth=configured_line_width(event_line_width, 1.0),
                 alpha=0.18,
                 label=labels.pop("postgres2_ready", None),
             )
-            if marker["promotion_start"] is not None:
+            if marker["promotion_start"] is not None and not compact_legend:
                 plt.axvline(
                     marker["promotion_start"],
                     color="tab:blue",
                     linestyle="-.",
-                    linewidth=1.0,
+                    linewidth=configured_line_width(event_line_width, 1.0),
                     alpha=0.35,
                     label=labels.pop("promotion_start", None),
                 )
@@ -1000,16 +1180,16 @@ def draw_restart_markers(markers, mode):
                     marker["standby_ready"],
                     color="tab:cyan",
                     linestyle="-.",
-                    linewidth=1.0,
+                    linewidth=configured_line_width(event_line_width, 1.0),
                     alpha=0.35,
                     label=labels.pop("standby_ready", None),
                 )
-            if marker["promotion_done"] is not None:
+            if marker["promotion_done"] is not None and not compact_legend:
                 plt.axvline(
                     marker["promotion_done"],
                     color="tab:blue",
                     linestyle="--",
-                    linewidth=1.0,
+                    linewidth=configured_line_width(event_line_width, 1.0),
                     alpha=0.35,
                     label=labels.pop("promotion_done", None),
                 )
@@ -1017,20 +1197,21 @@ def draw_restart_markers(markers, mode):
             marker["resume"],
             color="tab:green",
             linestyle="--",
-            linewidth=1.0,
+            linewidth=configured_line_width(event_line_width, 1.0),
             alpha=0.35,
             label=labels.pop("resume", None),
         )
     note_label = (
         "Median Median service interruption"
-        if all(marker["prepared"] for marker in markers)
+        if prepared
         else "Median service interruption"
     )
-    draw_restart_note(
-        restart_durations,
-        note_label,
-        preparation_phase_durations(markers),
-    )
+    if draw_timing_note:
+        draw_restart_note(
+            restart_durations,
+            note_label,
+            preparation_phase_durations(markers),
+        )
 
 
 def scenario_name(path):
@@ -1239,6 +1420,53 @@ def parse_args():
         help="Do not draw migration timing markers.",
     )
     parser.add_argument(
+        "--no-timing-note",
+        action="store_true",
+        help="Do not draw written timing summaries; keep timing markers.",
+    )
+    parser.add_argument(
+        "--no-legend",
+        action="store_true",
+        help="Do not draw the plot legend.",
+    )
+    parser.add_argument(
+        "--compact-legend",
+        action="store_true",
+        help="Draw a compact legend containing only the primary comparison and migration entries.",
+    )
+    parser.add_argument(
+        "--no-y-tick-labels",
+        action="store_true",
+        help="Hide y-axis tick labels while retaining ticks and grid lines.",
+    )
+    parser.add_argument(
+        "--shade-migration-phase",
+        action="store_true",
+        help="Shade the active migration or prepared-standby phase while excluding the downtime/switchover window.",
+    )
+    parser.add_argument(
+        "--baseline-color",
+        default="tab:gray",
+        help="Matplotlib color for the baseline median and IQR. Default: tab:gray",
+    )
+    parser.add_argument(
+        "--main-line-width",
+        type=float,
+        default=2.4,
+        help="Line width for the primary median or mean. Default: 2.4",
+    )
+    parser.add_argument(
+        "--baseline-line-width",
+        type=float,
+        default=2.0,
+        help="Line width for the baseline median. Default: 2.0",
+    )
+    parser.add_argument(
+        "--event-line-width",
+        type=float,
+        help="Override the line width of timing-event markers.",
+    )
+    parser.add_argument(
         "--timing-csv",
         type=Path,
         help="Scenario timing CSV. Defaults to <scenario>/<scenario>.csv",
@@ -1258,6 +1486,12 @@ def parse_args():
         parser.error("--y-range MIN must be less than MAX")
     if args.x_tick_step is not None and args.x_tick_step <= 0:
         parser.error("--x-tick-step must be greater than zero")
+    if args.main_line_width <= 0:
+        parser.error("--main-line-width must be greater than zero")
+    if args.baseline_line_width <= 0:
+        parser.error("--baseline-line-width must be greater than zero")
+    if args.event_line_width is not None and args.event_line_width <= 0:
+        parser.error("--event-line-width must be greater than zero")
     if args.host_divisor <= 0:
         parser.error("--host-divisor must be greater than zero")
     if any(run <= 0 for run in args.exclude_run):
@@ -1275,14 +1509,38 @@ def parse_args():
         parser.error("--primary-label and --restart-overlay-label require --restart-overlay-dir")
     if args.batch is not None and args.restart_overlay_dir is not None:
         parser.error("--restart-overlay-dir is only supported for single-scenario plotting")
+    if args.no_legend and args.compact_legend:
+        parser.error("--no-legend and --compact-legend are mutually exclusive")
     return args
 
 
-def draw_markers(timing_markers, restart_markers, timing_mode):
+def draw_markers(
+    timing_markers,
+    restart_markers,
+    timing_mode,
+    draw_timing_note=True,
+    shade_migration_phase=False,
+    event_line_width=None,
+    compact_legend=False,
+):
     if timing_markers:
-        draw_timing_markers(timing_markers, timing_mode)
+        draw_timing_markers(
+            timing_markers,
+            timing_mode,
+            draw_timing_note,
+            shade_migration_phase,
+            event_line_width,
+            compact_legend,
+        )
     else:
-        draw_restart_markers(restart_markers, timing_mode)
+        draw_restart_markers(
+            restart_markers,
+            timing_mode,
+            draw_timing_note,
+            event_line_width,
+            compact_legend,
+            shade_migration_phase,
+        )
 
 
 def collect_series(
@@ -1327,6 +1585,15 @@ def plot_metric(
     restart_markers,
     timing_mode,
     no_timing,
+    draw_timing_note=True,
+    draw_legend=True,
+    compact_legend=False,
+    draw_y_tick_labels=True,
+    shade_migration_phase=False,
+    baseline_color="tab:gray",
+    main_line_width=2.4,
+    baseline_line_width=2.0,
+    event_line_width=None,
     x_range=None,
     y_range=None,
     x_tick_step=None,
@@ -1397,7 +1664,13 @@ def plot_metric(
 
         median_label = f"{primary_label} Median" if primary_label else "Median"
         iqr_label = f"{primary_label} IQR" if primary_label else "IQR"
-        plt.plot(median_xs, median_ys, color="black", linewidth=2.4, label=median_label)
+        plt.plot(
+            median_xs,
+            median_ys,
+            color="black",
+            linewidth=main_line_width,
+            label=median_label,
+        )
         if draw_iqr:
             plt.fill_between(
                 median_xs,
@@ -1418,9 +1691,9 @@ def plot_metric(
             plt.plot(
                 baseline_xs,
                 baseline_ys,
-                color="tab:gray",
+                color=baseline_color,
                 linestyle="--",
-                linewidth=2.0,
+                linewidth=baseline_line_width,
                 label="Baseline median",
             )
             if draw_iqr and draw_baseline_iqr:
@@ -1428,7 +1701,7 @@ def plot_metric(
                     baseline_xs,
                     baseline_q1,
                     baseline_q3,
-                    color="tab:gray",
+                    color=baseline_color,
                     alpha=0.12,
                     label="Baseline IQR",
                 )
@@ -1450,13 +1723,27 @@ def plot_metric(
                     mean_ys,
                     markers=restart_markers,
                 )
-            plt.plot(mean_xs, mean_ys, color="black", linewidth=2.4, label="Mean")
+            plt.plot(
+                mean_xs,
+                mean_ys,
+                color="black",
+                linewidth=main_line_width,
+                label="Mean",
+            )
 
     axes = plt.gca()
     plot_handles, plot_labels = axes.get_legend_handles_labels()
 
     if not no_timing:
-        draw_markers(timing_markers, restart_markers, timing_mode)
+        draw_markers(
+            timing_markers,
+            restart_markers,
+            timing_mode,
+            draw_timing_note,
+            shade_migration_phase,
+            event_line_width,
+            compact_legend,
+        )
 
     all_handles, all_labels = axes.get_legend_handles_labels()
     event_handles = all_handles[len(plot_handles):]
@@ -1472,13 +1759,22 @@ def plot_metric(
     if x_tick_step is not None:
         plt.gca().xaxis.set_major_locator(MultipleLocator(x_tick_step))
     plt.grid(True, alpha=0.25)
-    draw_grouped_legend(
-        plot_handles,
-        plot_labels,
-        event_handles,
-        event_labels,
-    )
+    if compact_legend:
+        draw_compact_legend(all_handles, all_labels)
+    elif draw_legend:
+        draw_grouped_legend(
+            plot_handles,
+            plot_labels,
+            event_handles,
+            event_labels,
+        )
+    if not draw_y_tick_labels:
+        for tick_label in plt.gca().get_yticklabels():
+            tick_label.set_color("white")
+        plt.gca().yaxis.get_offset_text().set_color("white")
     plt.tight_layout()
+    if compact_legend:
+        plt.subplots_adjust(top=0.875)
     plt.savefig(output, dpi=160)
     plt.close()
     print(f"Wrote {output}")
@@ -1514,6 +1810,15 @@ def plot_metric_set(
         restart_markers,
         args.timing_mode,
         args.no_timing,
+        draw_timing_note=not args.no_timing_note,
+        draw_legend=not args.no_legend,
+        compact_legend=args.compact_legend,
+        draw_y_tick_labels=not args.no_y_tick_labels,
+        shade_migration_phase=args.shade_migration_phase,
+        baseline_color=args.baseline_color,
+        main_line_width=args.main_line_width,
+        baseline_line_width=args.baseline_line_width,
+        event_line_width=args.event_line_width,
         x_range=args.x_range,
         y_range=args.y_range,
         x_tick_step=args.x_tick_step,
@@ -1534,6 +1839,15 @@ def plot_metric_set(
         restart_markers,
         args.timing_mode,
         args.no_timing,
+        draw_timing_note=not args.no_timing_note,
+        draw_legend=not args.no_legend,
+        compact_legend=args.compact_legend,
+        draw_y_tick_labels=not args.no_y_tick_labels,
+        shade_migration_phase=args.shade_migration_phase,
+        baseline_color=args.baseline_color,
+        main_line_width=args.main_line_width,
+        baseline_line_width=args.baseline_line_width,
+        event_line_width=args.event_line_width,
         x_range=args.x_range,
         y_range=args.y_range,
         x_tick_step=args.x_tick_step,
@@ -1599,12 +1913,10 @@ def plot_scenario(args, scenario_dir, output=None):
     if not run_groups:
         raise SystemExit(f"No included bench-run-*.csv files found in {scenario_dir}")
 
-    timing_markers = []
+    timing_markers = read_timing_markers(scenario_dir, args.timing_csv)
     restart_markers = []
-    if not args.no_timing:
-        timing_markers = read_timing_markers(scenario_dir, args.timing_csv)
-        if not timing_markers:
-            restart_markers = read_restart_markers(scenario_dir, args.timing_csv)
+    if not timing_markers:
+        restart_markers = read_restart_markers(scenario_dir, args.timing_csv)
     timing_markers = [
         marker for marker in timing_markers
         if marker["run"] not in excluded_runs
@@ -1731,7 +2043,7 @@ def plot_scenario(args, scenario_dir, output=None):
                 "throughput",
                 args.title if args.title is not None else f"{name} throughput",
                 args.title if args.title is not None else f"{name} median throughput",
-                args.y_label or "Throughput [operations/s]",
+                args.y_label, #or "Throughput [operations/s]",
                 timing_markers,
                 restart_markers,
                 median_output=args.median_output,
